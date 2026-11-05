@@ -1,0 +1,173 @@
+# Continuous integration: every push builds the engine, runs all tests, the crash test and
+# the one-command Docker demo.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  engine:
+    name: C++ engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      # The live Redis reader is built on Linux only (it needs hiredis); Windows builds the rest.
+      - name: Install hiredis (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libhiredis-dev
+
+      - name: Configure
+        shell: bash
+        run: |
+          redis=OFF
+          if [ "$RUNNER_OS" = "Linux" ]; then redis=ON; fi
+          cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release -DPJT_WITH_REDIS=$redis
+
+      - name: Build
+        run: cmake --build engine/build --config Release
+
+      - name: Run tests
+        run: ctest --test-dir engine/build -C Release --output-on-failure
+
+  # Run every C++ test with AddressSanitizer (+ UndefinedBehaviorSanitizer) and ThreadSanitizer.
+  sanitizers:
+    name: C++ engine with ${{ matrix.sanitizer }} sanitizer
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: [address, thread]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      # ThreadSanitizer can't start on newer kernels' high address randomisation; lower it.
+      - name: Allow ThreadSanitizer to run
+        if: matrix.sanitizer == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure (Debug + sanitizer)
+        run: cmake -S engine -B engine/build-san -DCMAKE_BUILD_TYPE=Debug -DPJT_SANITIZE=${{ matrix.sanitizer }}
+
+      - name: Build
+        run: cmake --build engine/build-san -j 4
+
+      - name: Run tests
+        env:
+          ASAN_OPTIONS: halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: ctest --test-dir engine/build-san --output-on-failure
+
+  python:
+    name: Python tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install test packages
+        run: pip install -r requirements-dev.txt
+
+      # The end-to-end tests run the real engine on simulated data.
+      - name: Build the engine
+        run: |
+          cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release -DPJT_BUILD_TESTS=OFF
+          cmake --build engine/build -j 4
+
+      - name: Run tests with coverage
+        run: python -m pytest --cov --cov-report=term
+
+  # The live path through Redis: score the alerts, kill the engine mid-run, and load-test it.
+  integration:
+    name: Redis crash test and load test
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7.4-alpine
+        ports:
+          - 6379:6379
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install packages
+        run: |
+          pip install -r requirements.txt
+          sudo apt-get update && sudo apt-get install -y libhiredis-dev
+
+      - name: Build the engine
+        run: |
+          cmake -S engine -B engine/build -DCMAKE_BUILD_TYPE=Release -DPJT_WITH_REDIS=ON -DPJT_BUILD_TESTS=OFF
+          cmake --build engine/build -j 4
+
+      - name: Simulate 5,000 payments
+        run: python -m sim.generate --payments 5000 --out data
+
+      - name: Score the alerts
+        run: |
+          engine/build/pjt_replay data/events.jsonl --out data/records.jsonl --repeat 5
+          python -m scripts.evaluate --labels data/labels.csv --records data/records.jsonl
+
+      - name: Crash test (kill the engine mid-run)
+        run: python -m scripts.crash_test --events data/events.jsonl
+
+      - name: Load test
+        run: python -m scripts.load_test --rates 5000 10000 20000 --seconds 5
+
+  docker:
+    name: Docker one-command demo
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+
+      - name: docker compose up --build
+        run: docker compose up --build --detach
+
+      - name: Check the API and dashboard answer, and payments are flowing
+        run: |
+          for i in $(seq 1 60); do curl -fs http://127.0.0.1:8501/_stcore/health && break; sleep 2; done
+          sleep 20
+          curl -fs http://127.0.0.1:8000/v1/health
+          payments=$(curl -fs http://127.0.0.1:8000/v1/health | python3 -c "import sys, json; print(json.load(sys.stdin)['payments'])")
+          echo "payments tracked so far: $payments"
+          test "$payments" -gt 0
+
+      - name: Crash and restart the engine
+        run: |
+          docker compose kill engine
+          sleep 3
+          docker compose start engine
+          sleep 10
+          docker compose logs engine | tail -5
+          docker compose logs engine | grep "loaded snapshot"
+
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs
+
+      - name: Stop
+        if: always()
+        run: docker compose down --volumes
