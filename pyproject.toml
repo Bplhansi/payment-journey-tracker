@@ -1,0 +1,18 @@
+[project]
+name = "payment-journey-tracker"
+version = "1.0.0"
+description = "Follows simulated payments end to end and raises alerts when one gets stuck, fails or behaves oddly."
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["sim", "api", "scripts"]
+# These need a running Redis; the integration CI job runs them instead.
+omit = ["scripts/crash_test.py", "scripts/load_test.py", "scripts/engine_harness.py", "sim/publish.py"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"

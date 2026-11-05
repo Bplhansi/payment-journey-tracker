@@ -1,0 +1,64 @@
+# The whole system with one command:  docker compose up --build
+# Then open the dashboard at http://localhost:8501 and the API at http://localhost:8000/docs
+#
+# simulator -> Redis stream pjt:events -> engine (C++) -> Redis stream pjt:out -> ingest -> SQLite
+#                                                                          API + dashboard read SQLite
+
+x-app: &app
+  build: .
+  image: payment-journey-tracker:latest
+  environment:
+    REDIS_URL: redis://redis:6379
+    PJT_DB: /app/data/tracker.db
+  volumes:
+    - pjt-data:/app/data
+  depends_on:
+    redis:
+      condition: service_healthy
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]  # keeps the queue on disk
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    volumes:
+      - redis-data:/data
+
+  engine:
+    <<: *app
+    command: ["pjt_stream", "--config", "config/engine.ini", "--snapshot", "/app/data/engine.snapshot"]
+    restart: unless-stopped
+
+  ingest:
+    <<: *app
+    command: ["python", "-m", "api.ingest", "--redis", "redis://redis:6379"]
+    restart: unless-stopped
+
+  api:
+    <<: *app
+    command: ["python", "-m", "uvicorn", "api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  dashboard:
+    <<: *app
+    command: ["python", "-m", "streamlit", "run", "dashboard/app.py", "--server.port", "8501",
+              "--server.address", "0.0.0.0", "--server.headless", "true", "--browser.gatherUsageStats", "false"]
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+  # Creates 15,000 simulated payments and sends them in real time (about 5 minutes).
+  simulator:
+    <<: *app
+    command: ["sh", "-c", "python -m sim.generate --payments 15000 --out /app/data/sim && python -m sim.publish /app/data/sim/events.jsonl --speed 1"]
+    restart: "no"
+
+volumes:
+  pjt-data:
+  redis-data:

@@ -1,0 +1,5 @@
+# Python packages needed to develop and test this project.
+-r requirements.txt
+pytest==8.4.2
+pytest-cov==7.1.0
+httpx2==2.13.1
