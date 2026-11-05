@@ -59,6 +59,9 @@ if(PJT_WITH_REDIS)
   set(REDIS_PLUS_PLUS_BUILD_TEST OFF CACHE BOOL "" FORCE)
   set(REDIS_PLUS_PLUS_BUILD_SHARED OFF CACHE BOOL "" FORCE)
   set(REDIS_PLUS_PLUS_CXX_STANDARD 20 CACHE STRING "" FORCE)
+  # redis-plus-plus 1.3.13 asks for a very old CMake version, which CMake 4 refuses.
+  # This lets it configure anyway (it builds fine with modern CMake).
+  set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
   # redis-plus-plus 1.3.13, pinned to its exact commit.
   FetchContent_Declare(redis_plus_plus
     GIT_REPOSITORY https://github.com/sewenew/redis-plus-plus.git
